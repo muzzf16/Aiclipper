@@ -68,6 +68,12 @@ export const SocialUpload: React.FC<SocialUploadProps> = ({
         try {
             const { authUrl } = await apiService.getOAuthUrl(platform);
 
+            // Check for simulation/placeholder URL
+            if (authUrl.startsWith('#')) {
+                setSelectedPlatform(platform);
+                return;
+            }
+
             // Open OAuth in new window
             const width = 600;
             const height = 700;

@@ -1,6 +1,30 @@
 import express from 'express';
+import { google } from 'googleapis';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 const router = express.Router();
+
+// ES module __dirname equivalent
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// In-memory token storage (Use a database in production)
+const tokens = {};
+
+// YouTube OAuth Configuration
+const youtubeConfig = {
+    clientId: process.env.YOUTUBE_CLIENT_ID,
+    clientSecret: process.env.YOUTUBE_CLIENT_SECRET,
+    redirectUri: process.env.YOUTUBE_REDIRECT_URI || 'http://localhost:5000/api/social/oauth/callback',
+};
+
+const oauth2Client = new google.auth.OAuth2(
+    youtubeConfig.clientId,
+    youtubeConfig.clientSecret,
+    youtubeConfig.redirectUri
+);
 
 /**
  * GET /api/social/oauth/:platform
@@ -10,30 +34,80 @@ router.get('/oauth/:platform', async (req, res, next) => {
     try {
         const { platform } = req.params;
 
-        if (!['youtube', 'tiktok', 'instagram'].includes(platform)) {
-            return res.status(400).json({
-                status: 'error',
-                message: 'Invalid platform. Must be youtube, tiktok, or instagram.',
+        if (platform === 'youtube') {
+            const scopes = [
+                'https://www.googleapis.com/auth/youtube.upload',
+                'https://www.googleapis.com/auth/youtube.readonly'
+            ];
+
+            const authUrl = oauth2Client.generateAuthUrl({
+                access_type: 'offline',
+                scope: scopes,
+                state: 'youtube', // Pass platform as state
+                include_granted_scopes: true
+            });
+
+            return res.json({
+                status: 'ok',
+                authUrl,
             });
         }
 
-        // TODO: Implement OAuth flow for each platform
-        // This is a placeholder for the MVP
-        // In production, implement proper OAuth 2.0 flows:
-        //
-        // YouTube: https://developers.google.com/youtube/v3/guides/auth/server-side-web-apps
-        // TikTok: https://developers.tiktok.com/doc/login-kit-web
-        // Instagram: https://developers.facebook.com/docs/instagram-basic-display-api/getting-started
+        // TODO: Implement TikTok and Instagram
+        if (['tiktok', 'instagram'].includes(platform)) {
+            return res.json({
+                status: 'ok',
+                authUrl: `#oauth-${platform}`, // Keep simulation for others for now
+                message: `${platform} OAuth not yet implemented`,
+            });
+        }
 
-        res.json({
-            status: 'ok',
-            authUrl: `#oauth-${platform}`,
-            state: `state-${Date.now()}`,
-            message: 'OAuth implementation pending. See route comments for implementation guide.',
+        return res.status(400).json({
+            status: 'error',
+            message: 'Invalid platform',
         });
 
     } catch (error) {
         next(error);
+    }
+});
+
+/**
+ * GET /api/social/oauth/callback
+ * Handle OAuth callback
+ */
+router.get('/oauth/callback', async (req, res, next) => {
+    try {
+        const { code, state } = req.query; // state contains the platform
+
+        if (state === 'youtube') {
+            const { tokens: newTokens } = await oauth2Client.getToken(code);
+            oauth2Client.setCredentials(newTokens);
+
+            // Store tokens (in-memory for now)
+            tokens['youtube'] = newTokens;
+
+            // Return HTML that closes the popup and notifies the opener
+            const html = `
+                <html>
+                    <body>
+                        <h1>Authentication Successful</h1>
+                        <p>You can close this window now.</p>
+                        <script>
+                            window.opener.postMessage({ type: 'oauth_success', platform: 'youtube' }, '*');
+                            window.close();
+                        </script>
+                    </body>
+                </html>
+            `;
+            return res.send(html);
+        }
+
+        res.status(400).send('Invalid platform state');
+
+    } catch (error) {
+        console.error('OAuth Callback Error:', error);
+        res.status(500).send('Authentication failed');
     }
 });
 
@@ -44,14 +118,7 @@ router.get('/oauth/:platform', async (req, res, next) => {
 router.post('/upload/:platform', async (req, res, next) => {
     try {
         const { platform } = req.params;
-        const { filePath, clipId, title, caption, tags, accessToken } = req.body;
-
-        if (!['youtube', 'tiktok', 'instagram'].includes(platform)) {
-            return res.status(400).json({
-                status: 'error',
-                message: 'Invalid platform',
-            });
-        }
+        const { filePath, title, caption, tags } = req.body;
 
         if (!filePath || !title) {
             return res.status(400).json({
@@ -60,49 +127,82 @@ router.post('/upload/:platform', async (req, res, next) => {
             });
         }
 
-        console.log(`📤 Uploading to ${platform}:`, { title, caption, tags });
+        if (platform === 'youtube') {
+            if (!tokens['youtube']) {
+                return res.status(401).json({
+                    status: 'error',
+                    message: 'Not authenticated with YouTube. Please connect first.',
+                });
+            }
 
-        // TODO: Implement actual upload logic for each platform
-        // This is a placeholder that simulates success
-        //
-        // YouTube Shorts: Use YouTube Data API v3
-        // TikTok: Use TikTok Content Posting API
-        // Instagram Reels: Use Instagram Graph API
+            oauth2Client.setCredentials(tokens['youtube']);
+            const youtube = google.youtube({ version: 'v3', auth: oauth2Client });
 
-        // Simulate upload delay
-        await new Promise(resolve => setTimeout(resolve, 2000));
+            // Construct absolute path to file
+            // Assuming filePath is the fileId/filename in the uploads directory
+            const uploadDir = path.join(__dirname, '../uploads');
+            const videoPath = path.join(uploadDir, filePath.endsWith('.mp4') ? filePath : `${filePath}.mp4`);
 
-        res.json({
-            success: true,
-            platform,
-            postUrl: `https://${platform}.com/post/${clipId}`,
-            postId: `${platform}-${clipId}`,
-            message: `Upload to ${platform} simulated successfully. Implement actual API calls for production.`,
+            if (!fs.existsSync(videoPath)) {
+                return res.status(404).json({
+                    status: 'error',
+                    message: 'Video file not found',
+                });
+            }
+
+            const fileSize = fs.statSync(videoPath).size;
+
+            const resUpload = await youtube.videos.insert({
+                part: 'snippet,status',
+                requestBody: {
+                    snippet: {
+                        title,
+                        description: `${caption}\n\nTags: ${tags.join(', ')}`,
+                        tags: tags,
+                    },
+                    status: {
+                        privacyStatus: 'private', // Default to private for safety
+                        selfDeclaredMadeForKids: false,
+                    },
+                },
+                media: {
+                    body: fs.createReadStream(videoPath),
+                },
+            }, {
+                // Use the underlying axios instance to track progress if needed
+                onUploadProgress: evt => {
+                    const progress = (evt.bytesRead / fileSize) * 100;
+                    // console.log(`${Math.round(progress)}% complete`);
+                },
+            });
+
+            return res.json({
+                success: true,
+                platform: 'youtube',
+                postUrl: `https://youtu.be/${resUpload.data.id}`,
+                postId: resUpload.data.id,
+                message: 'Uploaded to YouTube successfully!',
+            });
+        }
+
+        // Simulation for other platforms
+        if (['tiktok', 'instagram'].includes(platform)) {
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            return res.json({
+                success: true,
+                platform,
+                postUrl: `https://${platform}.com/post/simulated`,
+                message: `Upload to ${platform} simulated successfully.`,
+            });
+        }
+
+        res.status(400).json({
+            status: 'error',
+            message: 'Invalid platform',
         });
 
     } catch (error) {
-        next(error);
-    }
-});
-
-/**
- * POST /api/social/oauth/callback
- * Handle OAuth callback
- */
-router.post('/oauth/callback', async (req, res, next) => {
-    try {
-        const { platform, code, state } = req.body;
-
-        // TODO: Exchange code for access token
-        // Store tokens securely
-
-        res.json({
-            status: 'ok',
-            accessToken: `mock-token-${platform}`,
-            expiresIn: 3600,
-        });
-
-    } catch (error) {
+        console.error('Upload Error:', error);
         next(error);
     }
 });
